@@ -186,12 +186,63 @@ literal, even if they're invalid for that base:
 The entire malformed literal is consumed as a single token, not split into multiple tokens. The
 error message pinpoints the specific invalid character within the literal.
 
-**Edge case: Non-digit letters stop consumption**
+**Edge case: Why letters sometimes stop consumption**
 
-* `0xGHI` → `token.INT` (`"0x"`) + error + `token.IDENT` (`"GHI"`)
-  * Hex scanning stops at `G` (not a hex digit), producing two separate tokens
-* `123abc` → `token.INT` (`"123"`) + `token.IDENT` (`"abc"`)
-  * No error because `123` is valid, `abc` is a separate identifier
+The key is in the `digits()` function's loop conditions:
+
+* **For base ≤ 10** (binary, octal, decimal): `for isDecimal(s.ch) || s.ch == '_'`
+  * Continues consuming ANY decimal digit (0-9), even if invalid for that base
+  * `0o89` consumes both `8` and `9` because `isDecimal('8')` is true, then reports error
+  * `0b12345` consumes all digits because `isDecimal('2')` through `isDecimal('5')` are true
+
+* **For base > 10** (hexadecimal): `for isHex(s.ch) || s.ch == '_'`
+  * Only continues if character is hex digit (0-9, a-f) or underscore
+  * `0xGHI` stops at `G` because `isHex('G')` is false → two tokens: `"0x"` + `"GHI"`
+  * `0xfghi` stops at `g` because `isHex('g')` is false → two tokens: `"0xf"` + `"ghi"`
+
+* **Letters after any base**: Non-hex letters (g-z) always stop consumption
+  * `0b1abc` → `"0b1"` + `"abc"` (no error, valid binary followed by identifier)
+  * `123xyz` → `"123"` + `"xyz"` (no error, valid decimal followed by identifier)
+
+The scanner uses `isDecimal()` and `isHex()` as **lookahead predicates** to decide whether to
+continue consuming characters as part of the numeric literal.
+
+**Why the inconsistency? A pragmatic choice**
+
+You might notice an asymmetry:
+* `0o89` consumes digits beyond base → "looks like attempted octal"
+* `0xGHI` stops at non-hex letters → "doesn't look like hex"
+
+Why not treat `G` as "looks like attempted hex" similar to `8` in octal?
+
+The likely rationale (this behavior is consistent in both `go/scanner` and `cmd/compile/internal/syntax`):
+
+1. **Digit typos are obvious**: `0o789` is clearly a typo in octal context (file permissions, etc.)
+   * All digits 0-9 "look like" they belong in numbers
+   * User likely meant `0o755` or `0o777`
+
+2. **Letters beyond 'f' are ambiguous**: `0xGOOD` could be:
+   * Typo in hex literal, OR
+   * Missing space: `0x GOOD` (hex zero followed by identifier)
+
+3. **Identifiers commonly use capital letters**: `GetValue`, `HTTPClient`, `ParseURL`
+   * Treating `0xGOOD` as `0x` + `GOOD` preserves the identifier for error messages
+   * Alternative (consuming as `"0xGOOD"`) would hide the identifier completely
+
+4. **Different error recovery value**:
+   * `0o789` → single token preserves the attempted literal for error context
+   * `0xGOOD` → two tokens (`0x` + `GOOD`) helps identify what the identifier was
+
+This is a pragmatic design choice that optimizes for the most likely programmer intent based on
+common usage patterns.
+
+**Trade-off: Less specific errors for adjacent tokens**
+
+This design creates a limitation: `123xyz` produces two tokens (`INT` + `IDENT`) leading to a
+generic parser error "expected ';', found xyz" rather than a specific scanner error about a
+malformed literal. Compare to `0o789` which gives "invalid digit '8' in octal literal". The parser
+could detect adjacent tokens via position information but doesn't, making error messages less
+specific for cases like `123xyz`.
 
 ### Scanner API Contract
 
@@ -259,12 +310,15 @@ func foo() {
 }
 ```
 
-When `@` produces an `ILLEGAL` token:
+When `@` produces an `ILLEGAL` token, the parser creates this AST:
 
-1. Parser reports the error
-2. Calls `advance()` to skip past the bad token
-3. Continues parsing `z := 3` successfully
-4. Can report multiple errors in one pass
+1. Statement 1: `x := 1` (parsed successfully as `ast.AssignStmt`)
+2. Statement 2: `y := BadExpr` (error placeholder, `ast.BadExpr` spans lines 5-7)
+3. Error reported: "expected operand, found 'ILLEGAL'"
+
+Note: `z := 3` is **not** parsed as a separate statement. The parser's error recovery consumed
+tokens up to the closing brace, including `z := 3`, as part of the `BadExpr` region. The parser
+creates a `BadExpr` node to preserve the AST structure while indicating an error occurred
 
 ## Compiler Syntax Package
 
